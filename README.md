@@ -47,12 +47,26 @@ builds:
 
 ## Building
 
-See `docs/building.md`. A Nix flake is planned. Secrets never go into the repo
-or the Nix store: the build reads them from the git-ignored `secrets/`.
+    nix build                     # ./result: SD card files without secrets + U-Boot
+    nix build .#kernel            # zImage, DTB, modules (incl. rtl8189fs), uAPI headers
+    nix build .#userspace         # camrtsp onvifd persond busybox wpa_supplicant dropbear tools
+    nix build .#model             # yolov5n.nnp
+    nix run .#sd-image -- secrets/ sd.img            # full 64 MiB card image
+    nix run .#sd-image -- --files secrets/ boot/     # only the FAT files, for an existing card
+    nix develop                   # toolchains for working on the sources
 
-- `secrets/wpa_supplicant.conf` (see `rootfs/etc/wpa_supplicant.conf.example`)
-- `secrets/authorized_keys`
-- `secrets/dropbear_ed25519_host_key`
+Secrets never go into the repo or the Nix store: `sd-image` reads them from a
+git-ignored directory and adds them to the initramfs outside the store.
+
+- `wpa_supplicant.conf` (see `rootfs/etc/wpa_supplicant.conf.example`)
+- `authorized_keys`
+- `dropbear_ed25519_host_key` (generated on first use if missing)
+
+The card image puts U-Boot at 8 KiB and one 32 MiB FAT16 partition at 1 MiB
+holding zImage, initramfs.uImage, the DTB, 8189fs.ko and yolov5n.nnp. All
+third-party sources are fetched by the hashes in `nix/sources.nix` and
+`nix/files.nix` (the same pins as `upstream.lock`). `docs/building.md` has the
+equivalent manual commands.
 
 ## Status
 

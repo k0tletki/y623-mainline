@@ -1,7 +1,8 @@
 # Building (manual)
 
-Until the flake exists, these are the commands the current image was built with.
-Fetch the sources listed in `upstream.lock` and check their hashes.
+The flake (`nix build`, see README) is the reference build. These are the
+equivalent manual commands. Fetch the sources listed in `upstream.lock` and
+check their hashes.
 
 Toolchains used:
 
