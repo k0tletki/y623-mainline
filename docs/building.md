@@ -66,7 +66,7 @@ dropbear (`configs/dropbear-localoptions.h`; configured with `--host=arm-linux-m
 --disable-zlib --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp
 --disable-wtmpx --disable-pututline --disable-pututxline --disable-pam
 --enable-static --disable-harden`) are all built static with the same zig
-compiler. The flake will pin the exact invocations.
+compiler; `nix/userspace.nix` has the exact invocations.
 
 ## Detector model
 
