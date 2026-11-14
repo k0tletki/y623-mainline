@@ -1,0 +1,66 @@
+diff --git a/build.sh b/build.sh
+index 63e35f5eff60bf03dad205019965743c667b20c7..46f23b8a61eef752359f22f31744b9f77a04716c 100755
+--- a/build.sh
++++ b/build.sh
+@@ -41,7 +41,7 @@ build_v83x() {
+     make_opts="-C ${BOOT_SRCDIR} O=${builddir} -j$(nproc)"
+     out=output/u-boot-${soc}-${kind}.bin
+     fragments="openipc/openipc_config openipc/${soc}_config"
+-    [ "${kind}" = mmc ] && fragments="${fragments} openipc/mmc_config"
++    [ "${kind}" = mmc ] && fragments="${fragments} openipc/mmc_config openipc/sd_config"
+ 
+     rm -rf "${builddir}"
+     mkconfig "${builddir}" ${fragments} && \
+diff --git a/include/configs/openipc-common.h b/include/configs/openipc-common.h
+index dbb6e7ee736a562adb0380d674a66d2a4787cf46..58a29012fe818825c4f13229acfb049958bae3a5 100644
+--- a/include/configs/openipc-common.h
++++ b/include/configs/openipc-common.h
+@@ -95,7 +95,8 @@
+ 	"bootlimit=2\0" \
+ 	"altbootcmd=" OPENIPC_ALTBOOTCMD "\0" \
+ 	"fwrecovery=if env exists bootfail; then run fwupd; sleep 5; reset; fi\0" \
+-	"bootflash=run fwrecovery; setenv setargs setenv bootargs ${bootargs}; run setargs; run loadkernel; bootm ${baseaddr}; reset\0"
++	"bootflash=run fwrecovery; setenv setargs setenv bootargs ${bootargs}; run setargs; run loadkernel; bootm ${baseaddr}; reset\0" \
++	"sdboot=mmc dev 0; fatload mmc 0:1 0x41000000 zImage; fatload mmc 0:1 0x43000000 initramfs.uImage; fatload mmc 0:1 0x42000000 sun8i-v831-yi-y623.dtb; setenv bootargs earlycon console=ttyS0,115200 rdinit=/init; bootz 0x41000000 0x43000000 0x42000000\0"
+ 
+ /* The flash's MTD name in the vendor kernels: the SPI device's */
+ #define SFC "spi0.0"
+@@ -125,7 +126,7 @@
+ 	"mtdparts=" SFC ":" OPENIPC_MTDPARTS "\0" \
+ 	"bootargs=" CONFIG_BOOTARGS
+ 
+-#define CONFIG_BOOTCOMMAND "run bootflash"
++#define CONFIG_BOOTCOMMAND "run sdboot"
+ 
+ #define CONFIG_EXTRA_ENV_SETTINGS \
+ 	OPENIPC_ENV_COMMON \
+diff --git a/openipc/v831_config b/openipc/v831_config
+index 9f54400eca222f22fb5905bae1431b5df5e7f490..6900139df6da4c50f5bcb0a2d6ae8f4e7dfd4b4c 100644
+--- a/openipc/v831_config
++++ b/openipc/v831_config
+@@ -29,3 +29,6 @@ CONFIG_DRAM_SUN8I_V831_TPR2=0x00057041
+ CONFIG_DRAM_SUN8I_V831_TPR11=0x00120000
+ CONFIG_DRAM_SUN8I_V831_TPR12=0x23
+ CONFIG_DRAM_SUN8I_V831_TPR13=0x34000903
++# musl toolchain's assembler rejects dmb sy in Thumb mode; build ARM mode
++# CONFIG_SYS_THUMB_BUILD is not set
++# CONFIG_SPL_SYS_THUMB_BUILD is not set
+diff --git a/openipc/sd_config b/openipc/sd_config
+new file mode 100644
+index 0000000000000000000000000000000000000000..321143da442966b8500eaff382d8ee0a55c389d5
+--- /dev/null
++++ b/openipc/sd_config
+@@ -0,0 +1,13 @@
++# SD boot: boot the mainline 7.3.4 kernel/DTB/initramfs from the FAT partition
++# instead of the OpenIPC NOR image.  The camera's boot ROM tries SD first.
++CONFIG_CMD_BOOTZ=y
++# CONFIG_SILENT_CONSOLE is not set
++CONFIG_BOOTDELAY=3
++CONFIG_BOOTCOMMAND="mmc dev 0; fatload mmc 0:1 0x41000000 zImage; fatload mmc 0:1 0x43000000 initramfs.cpio.gz; setenv initrd_size ${filesize}; fatload mmc 0:1 0x42000000 sun8i-v831-yi-y623.dtb; setenv bootargs earlycon console=ttyS0,115200 rdinit=/init; bootz 0x41000000 0x43000000:${initrd_size} 0x42000000"
++# Boot at once and never read the console: UART0 RX floats on this board
++# and noise (a Ctrl-C byte) stopped autoboot -> "hung" reboots. Also no
++# boot counter: its DRAM word survives warm resets, Linux never clears it,
++# and after bootlimit warm boots altbootcmd tried the OpenIPC NOR layout
++# (not on this camera) and stopped in U-Boot.
++CONFIG_BOOTDELAY=-2
++# CONFIG_BOOTCOUNT_LIMIT is not set

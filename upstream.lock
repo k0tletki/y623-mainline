@@ -1,0 +1,14 @@
+# Third-party sources, fetched at build time; none of them is in this repo.
+# name          kind     source                                                        pin                                       sha256 / notes
+linux           tarball  https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.4.tar.xz 7.3.4                                      b11b6df8295e8e991ff040b71aaa4994a8b55caa23b6b092907f195b5840fd1f
+cedrus-bootlin  git      https://github.com/bootlin/linux                              4e9497947c56f10351ed8c000605dbe47d4aee46  path drivers/staging/media/sunxi/cedrus (kernel/overlay.sh)
+u-boot          git      https://github.com/OpenIPC/u-boot                             bd3334c112a87c5b4b41fb5c05999682414f003a  + u-boot/0001-v831-sd-boot.patch
+rtl8189fs       git      https://github.com/jwrdegoede/rtl8189ES_linux                 13bbdbc750bfaa37ff47dff063edcc857fad0584  branch rtl8189fs, unmodified
+busybox         tarball  https://busybox.net/downloads/busybox-1.37.0.tar.bz2          1.37.0                                     3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
+wpa_supplicant  tarball  https://w1.fi/releases/wpa_supplicant-2.11.tar.gz             2.11                                       912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a
+dropbear        git      https://github.com/mkj/dropbear                               28216cd9af822732a1549b78621c2ea9a76a0fe5  + configs/dropbear-localoptions.h
+tinyalsa        git      https://github.com/tinyalsa/tinyalsa                          a7cd26a17fe2add2ff38d2f281ed0b919187a068  unmodified
+nvdla-sw        git      https://github.com/nvdla/sw                                   79538ba1b52b040a4a4645f630e457fa01839e90  kmd/firmware/* + kmd/include/nvdla_interface.h, unmodified (BSD-3)
+yolov5n.onnx    file     https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx v7.0                         04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262 (AGPL-3.0)
+bus.jpg         file     https://raw.githubusercontent.com/ultralytics/yolov5/v7.0/data/images/bus.jpg v7.0                     33b198a1d2839bb9ac4c65d61f9e852196793cae9a0781360859425f6022b69c (test image)
+zidane.jpg      file     https://raw.githubusercontent.com/ultralytics/yolov5/v7.0/data/images/zidane.jpg v7.0                  356dad2107bb0254e4e4a81bc1d9c7140043e88569d546e5b404b19bffa77d0a (test image)

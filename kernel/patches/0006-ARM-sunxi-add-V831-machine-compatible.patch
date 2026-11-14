@@ -1,0 +1,18 @@
+Subject: [PATCH] ARM: sunxi: add allwinner,sun8i-v831 to the sun8i board list
+
+---
+ arch/arm/mach-sunxi/sunxi.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm/mach-sunxi/sunxi.c b/arch/arm/mach-sunxi/sunxi.c
+index e1b7945aac99e8119e7d1214e02e52b80e4d618b..a4e186ad6f0e0af1e992cbd39b7555fceafd483e 100644
+--- a/arch/arm/mach-sunxi/sunxi.c
++++ b/arch/arm/mach-sunxi/sunxi.c
+@@ -66,6 +66,7 @@ static const char * const sun8i_board_dt_compat[] = {
+ 	"allwinner,sun8i-r40",
+ 	"allwinner,sun8i-v3",
+ 	"allwinner,sun8i-v3s",
++	"allwinner,sun8i-v831",
+ 	NULL,
+ };
+ 

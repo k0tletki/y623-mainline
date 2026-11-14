@@ -1,0 +1,29 @@
+Subject: [PATCH] media: sunxi: hook up the V831 VIN, cedrus-enc and EISE drivers
+
+---
+ drivers/media/platform/sunxi/Kconfig  | 3 +++
+ drivers/media/platform/sunxi/Makefile | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/media/platform/sunxi/Kconfig b/drivers/media/platform/sunxi/Kconfig
+index 2dd15083a1d9fabd1f8fa8a05fb5066b10d46cc2..bccf2ce3824e23ffcb6e6956e955ab5682956ca8 100644
+--- a/drivers/media/platform/sunxi/Kconfig
++++ b/drivers/media/platform/sunxi/Kconfig
+@@ -8,3 +8,6 @@ source "drivers/media/platform/sunxi/sun6i-mipi-csi2/Kconfig"
+ source "drivers/media/platform/sunxi/sun8i-a83t-mipi-csi2/Kconfig"
+ source "drivers/media/platform/sunxi/sun8i-di/Kconfig"
+ source "drivers/media/platform/sunxi/sun8i-rotate/Kconfig"
++source "drivers/media/platform/sunxi/sun8i-v831-vin/Kconfig"
++source "drivers/media/platform/sunxi/sun8i-cedrus-enc/Kconfig"
++source "drivers/media/platform/sunxi/sun8i-eise/Kconfig"
+diff --git a/drivers/media/platform/sunxi/Makefile b/drivers/media/platform/sunxi/Makefile
+index 9aa01cb018836a7fab679bce719f0251d5946b3b..ffd0ad5763bbf0f9e7658abeecba84318d309608 100644
+--- a/drivers/media/platform/sunxi/Makefile
++++ b/drivers/media/platform/sunxi/Makefile
+@@ -6,3 +6,6 @@ obj-y		+= sun6i-mipi-csi2/
+ obj-y		+= sun8i-a83t-mipi-csi2/
+ obj-y		+= sun8i-di/
+ obj-y		+= sun8i-rotate/
++obj-y		+= sun8i-v831-vin/
++obj-y		+= sun8i-cedrus-enc/
++obj-y		+= sun8i-eise/

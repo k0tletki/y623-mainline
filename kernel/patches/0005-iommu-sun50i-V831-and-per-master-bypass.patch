@@ -1,0 +1,53 @@
+Subject: [PATCH] iommu: sun50i: add V831 and bypass masters not claimed in DT
+
+Only masters referenced by an "iommus" property are translated; all others
+stay in bypass, so devices that do not use the IOMMU (VIN, NPU) keep working
+with physical addresses.
+
+---
+ drivers/iommu/sun50i-iommu.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/sun50i-iommu.c b/drivers/iommu/sun50i-iommu.c
+index be3f1ce696ba29d5384bdcc2f180ad98516aa6a4..d5bed70cdb5cdba236791ba65982bc27eb9fa568 100644
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -107,6 +107,7 @@ struct sun50i_iommu {
+ 	void __iomem *base;
+ 	struct reset_control *reset;
+ 	struct clk *clk;
++	u32 masters;	/* masters claimed via DT "iommus"; others stay bypassed */
+ 
+ 	struct iommu_domain *domain;
+ 	struct kmem_cache *pt_pool;
+@@ -452,7 +453,7 @@ static int sun50i_iommu_enable(struct sun50i_iommu *iommu)
+ 		    IOMMU_TLB_PREFETCH_MASTER_ENABLE(3) |
+ 		    IOMMU_TLB_PREFETCH_MASTER_ENABLE(4) |
+ 		    IOMMU_TLB_PREFETCH_MASTER_ENABLE(5));
+-	iommu_write(iommu, IOMMU_BYPASS_REG, 0);
++	iommu_write(iommu, IOMMU_BYPASS_REG, ~iommu->masters & 0x3f);
+ 	iommu_write(iommu, IOMMU_INT_ENABLE_REG, IOMMU_INT_MASK);
+ 	iommu_write(iommu, IOMMU_DM_AUT_CTRL_REG(SUN50I_IOMMU_ACI_NONE),
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 0) |
+@@ -837,9 +838,12 @@ static int sun50i_iommu_of_xlate(struct device *dev,
+ 				 const struct of_phandle_args *args)
+ {
+ 	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
++	struct sun50i_iommu *iommu = platform_get_drvdata(iommu_pdev);
+ 	unsigned id = args->args[0];
+ 
+-	dev_iommu_priv_set(dev, platform_get_drvdata(iommu_pdev));
++	dev_iommu_priv_set(dev, iommu);
++	if (id < 6)
++		iommu->masters |= BIT(id);
+ 
+ 	put_device(&iommu_pdev->dev);
+ 
+@@ -1072,6 +1076,7 @@ err_free_cache:
+ 
+ static const struct of_device_id sun50i_iommu_dt[] = {
+ 	{ .compatible = "allwinner,sun50i-h6-iommu", },
++	{ .compatible = "allwinner,sun8i-v831-iommu", },
+ 	{ .compatible = "allwinner,sun50i-h616-iommu", },
+ 	{ /* sentinel */ },
+ };

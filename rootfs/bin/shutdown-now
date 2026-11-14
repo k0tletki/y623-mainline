@@ -1,0 +1,27 @@
+#!/bin/sh
+# shutdown-now reboot|poweroff|halt -- orderly shutdown, run by PID 1 when
+# busybox reboot/poweroff/halt signal it (SIGTERM/SIGUSR2/SIGUSR1).
+B=/bin/busybox
+what=${1:-reboot}
+echo "shutdown-now: $what" > /dev/console
+# From here on the hardware watchdog is the safety net: if anything below
+# hangs, the board resets 10 s later.
+$B killall wdog 2>/dev/null
+# stop the respawn loops, then the services (camrtsp releases VE/VIN/EISE)
+$B killall camera-up 2>/dev/null
+$B killall camrtsp onvifd 2>/dev/null
+i=0
+while [ $i -lt 20 ] && $B pidof camrtsp >/dev/null; do $B usleep 100000; i=$((i + 1)); done
+$B killall -9 camrtsp 2>/dev/null
+$B killall dropbear ntpd udhcpc wpa_supplicant 2>/dev/null
+$B sync
+$B umount /mnt 2>/dev/null
+$B umount -r /mnt 2>/dev/null
+# power-cycle the SD card (vmmc = PC4 switch) so the boot ROM finds it idle
+echo 4020000.mmc > /sys/bus/platform/drivers/sunxi-mmc/unbind 2>/dev/null
+$B usleep 500000
+case $what in
+    poweroff) exec $B poweroff -f ;;
+    halt) exec $B halt -f ;;
+    *) exec $B reboot -f ;;
+esac

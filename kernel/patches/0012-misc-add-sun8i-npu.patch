@@ -1,0 +1,437 @@
+Subject: [PATCH] misc: add Allwinner V831 NPU driver
+
+/dev/npu: power, clocks, resets, register-window mmap and contiguous buffers;
+the NVDLA units are programmed from userspace.
+
+---
+ drivers/misc/Kconfig               |   1 +
+ drivers/misc/Makefile              |   1 +
+ drivers/misc/sun8i-npu/Kconfig     |  12 ++
+ drivers/misc/sun8i-npu/Makefile    |   3 +
+ drivers/misc/sun8i-npu/sun8i_npu.c | 328 +++++++++++++++++++++++++++++++++++
+ include/uapi/linux/sun8i-npu.h     |  37 ++++
+ 6 files changed, 382 insertions(+)
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 7364931dad3a1f2bb2ba5aa86dc9917239f45aa7..4ac0b44a65fb78c8705acd96f9a2b88ab7f6cb54 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -586,4 +586,5 @@ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
+ source "drivers/misc/issei/Kconfig"
++source "drivers/misc/sun8i-npu/Kconfig"
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index e8d8d5d88c0df1201652bf31dd82667080d9be69..52dda86dee169b937baeb31ac5d1c85f2a538933 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -71,3 +71,4 @@ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_INTEL_SSEI)	+= issei/
++obj-$(CONFIG_SUN8I_NPU)		+= sun8i-npu/
+diff --git a/drivers/misc/sun8i-npu/Kconfig b/drivers/misc/sun8i-npu/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cf2e288ab38003c0b5b3d3151777b8a0f694d73
+--- /dev/null
++++ b/drivers/misc/sun8i-npu/Kconfig
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0
++config SUN8I_NPU
++	tristate "Allwinner V831 NPU (NVDLA nv_small)"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on COMMON_CLK && RESET_CONTROLLER && HAS_DMA
++	help
++	  Minimal /dev/npu driver: power, clocks, resets, an mmap of the
++	  register window and physically contiguous buffers. The NPU is
++	  programmed from userspace.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called sun8i-npu.
+diff --git a/drivers/misc/sun8i-npu/Makefile b/drivers/misc/sun8i-npu/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2606a8e65deb4d1a379f817ca5e67bc57078939
+--- /dev/null
++++ b/drivers/misc/sun8i-npu/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_SUN8I_NPU) += sun8i-npu.o
++sun8i-npu-y := sun8i_npu.o
+diff --git a/drivers/misc/sun8i-npu/sun8i_npu.c b/drivers/misc/sun8i-npu/sun8i_npu.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0a979c7828c404852711c611c65a42593eb96c3
+--- /dev/null
++++ b/drivers/misc/sun8i-npu/sun8i_npu.c
+@@ -0,0 +1,328 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner V831 NPU ("NNA", NVDLA nv_small based), minimal driver.
++ *
++ * Power, clocks and resets are handled here; the units are programmed from
++ * userspace through an mmap of the register window (as in the public reverse
++ * engineering work), with physically contiguous buffers allocated here.
++ * Completion is polled on the GLB interrupt status register (WAIT ioctl);
++ * the interrupt line is not used yet.
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/ktime.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include <linux/sun8i-npu.h>
++
++#define NPU_GLB_INTR_STATUS	0x100c
++#define NPU_MAX_BUFS		256
++#define NPU_BUF_SHIFT		20	/* mmap offset = handle << 20 */
++
++struct npu_buf {
++	void *vaddr;
++	dma_addr_t dma;
++	size_t size;
++	struct file *owner;
++};
++
++struct npu_dev {
++	struct device *dev;
++	struct miscdevice misc;
++	void __iomem *base;
++	phys_addr_t phys;
++	struct clk *ahb, *mod;
++	struct reset_control *rst_ahb, *rst_mod;
++	struct mutex lock;
++	struct npu_buf bufs[NPU_MAX_BUFS + 1];	/* index = handle, 0 unused */
++	bool open;
++};
++
++static struct npu_dev *to_npu(struct file *f)
++{
++	return container_of(f->private_data, struct npu_dev, misc);
++}
++
++static void npu_reset_pulse(struct npu_dev *n)
++{
++	reset_control_assert(n->rst_mod);
++	reset_control_assert(n->rst_ahb);
++	udelay(1);
++	reset_control_deassert(n->rst_ahb);
++	reset_control_deassert(n->rst_mod);
++	udelay(1);
++}
++
++static void npu_free_buf(struct npu_dev *n, unsigned int h)
++{
++	struct npu_buf *b = &n->bufs[h];
++
++	if (!b->vaddr)
++		return;
++	dma_free_coherent(n->dev, b->size, b->vaddr, b->dma);
++	memset(b, 0, sizeof(*b));
++}
++
++static long npu_alloc(struct npu_dev *n, struct file *f, void __user *arg)
++{
++	struct npu_alloc a;
++	unsigned int h;
++
++	if (copy_from_user(&a, arg, sizeof(a)))
++		return -EFAULT;
++	if (!a.size || a.size > SZ_16M)
++		return -EINVAL;
++	for (h = 1; h <= NPU_MAX_BUFS && n->bufs[h].vaddr; h++)
++		;
++	if (h > NPU_MAX_BUFS)
++		return -ENOSPC;
++	n->bufs[h].size = PAGE_ALIGN(a.size);
++	n->bufs[h].vaddr = dma_alloc_coherent(n->dev, n->bufs[h].size, &n->bufs[h].dma,
++					      GFP_KERNEL);
++	if (!n->bufs[h].vaddr) {
++		n->bufs[h].size = 0;
++		return -ENOMEM;
++	}
++	n->bufs[h].owner = f;
++	a.handle = h;
++	a.dma_addr = n->bufs[h].dma;
++	a.mmap_offset = (u64)h << NPU_BUF_SHIFT;
++	if (copy_to_user(arg, &a, sizeof(a))) {
++		npu_free_buf(n, h);
++		return -EFAULT;
++	}
++	return 0;
++}
++
++static long npu_wait(struct npu_dev *n, void __user *arg)
++{
++	struct npu_wait w;
++	ktime_t t0 = ktime_get();
++	u32 st;
++	int ret;
++
++	if (copy_from_user(&w, arg, sizeof(w)))
++		return -EFAULT;
++	if (!w.mask || w.timeout_ms > 10000)
++		return -EINVAL;
++	ret = readl_poll_timeout(n->base + NPU_GLB_INTR_STATUS, st,
++				 (st & w.mask) == w.mask, 20, w.timeout_ms * 1000);
++	w.status = st;
++	w.elapsed_us = ktime_us_delta(ktime_get(), t0);
++	writel(0xffffffff, n->base + NPU_GLB_INTR_STATUS);
++	if (copy_to_user(arg, &w, sizeof(w)))
++		return -EFAULT;
++	return ret;
++}
++
++static long npu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct npu_dev *n = to_npu(f);
++	void __user *p = (void __user *)arg;
++	long ret = 0;
++	u32 v;
++
++	mutex_lock(&n->lock);
++	switch (cmd) {
++	case NPU_IOC_ALLOC:
++		ret = npu_alloc(n, f, p);
++		break;
++	case NPU_IOC_FREE:
++		if (get_user(v, (u32 __user *)p))
++			ret = -EFAULT;
++		else if (!v || v > NPU_MAX_BUFS || n->bufs[v].owner != f)
++			ret = -EINVAL;
++		else
++			npu_free_buf(n, v);
++		break;
++	case NPU_IOC_RESET:
++		npu_reset_pulse(n);
++		break;
++	case NPU_IOC_SET_RATE:
++		if (get_user(v, (u32 __user *)p))
++			ret = -EFAULT;
++		else if (v < 50000000 || v > 800000000)
++			ret = -EINVAL;
++		else
++			ret = clk_set_rate(n->mod, v);
++		break;
++	case NPU_IOC_GET_RATE:
++		ret = put_user((u32)clk_get_rate(n->mod), (u32 __user *)p);
++		break;
++	case NPU_IOC_WAIT:
++		ret = npu_wait(n, p);
++		break;
++	default:
++		ret = -ENOTTY;
++	}
++	mutex_unlock(&n->lock);
++	return ret;
++}
++
++static int npu_mmap(struct file *f, struct vm_area_struct *vma)
++{
++	struct npu_dev *n = to_npu(f);
++	unsigned long len = vma->vm_end - vma->vm_start;
++	unsigned long h = vma->vm_pgoff >> (NPU_BUF_SHIFT - PAGE_SHIFT);
++	int ret;
++
++	if (vma->vm_pgoff == 0) {
++		if (len > NPU_REG_SIZE)
++			return -EINVAL;
++		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++		vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
++		return io_remap_pfn_range(vma, vma->vm_start, n->phys >> PAGE_SHIFT, len,
++					  vma->vm_page_prot);
++	}
++	if (vma->vm_pgoff & ((1UL << (NPU_BUF_SHIFT - PAGE_SHIFT)) - 1))
++		return -EINVAL;
++	mutex_lock(&n->lock);
++	if (!h || h > NPU_MAX_BUFS || !n->bufs[h].vaddr || n->bufs[h].owner != f ||
++	    len > n->bufs[h].size) {
++		mutex_unlock(&n->lock);
++		return -EINVAL;
++	}
++	vma->vm_pgoff = 0;
++	ret = dma_mmap_coherent(n->dev, vma, n->bufs[h].vaddr, n->bufs[h].dma, len);
++	mutex_unlock(&n->lock);
++	return ret;
++}
++
++static int npu_open(struct inode *inode, struct file *f)
++{
++	struct npu_dev *n = to_npu(f);
++	int ret = 0;
++
++	mutex_lock(&n->lock);
++	if (n->open)
++		ret = -EBUSY;
++	else
++		n->open = true;
++	mutex_unlock(&n->lock);
++	return ret;
++}
++
++static int npu_release(struct inode *inode, struct file *f)
++{
++	struct npu_dev *n = to_npu(f);
++	unsigned int h;
++
++	mutex_lock(&n->lock);
++	/* stop whatever userspace left running before its buffers go away */
++	npu_reset_pulse(n);
++	for (h = 1; h <= NPU_MAX_BUFS; h++)
++		if (n->bufs[h].owner == f)
++			npu_free_buf(n, h);
++	n->open = false;
++	mutex_unlock(&n->lock);
++	return 0;
++}
++
++static const struct file_operations npu_fops = {
++	.owner = THIS_MODULE,
++	.open = npu_open,
++	.release = npu_release,
++	.unlocked_ioctl = npu_ioctl,
++	.mmap = npu_mmap,
++	.llseek = noop_llseek,
++};
++
++static int npu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct npu_dev *n;
++	int ret;
++
++	n = devm_kzalloc(dev, sizeof(*n), GFP_KERNEL);
++	if (!n)
++		return -ENOMEM;
++	n->dev = dev;
++	mutex_init(&n->lock);
++	platform_set_drvdata(pdev, n);
++
++	n->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(n->base))
++		return PTR_ERR(n->base);
++	n->phys = res->start;
++	n->ahb = devm_clk_get(dev, "ahb");
++	n->mod = devm_clk_get(dev, "mod");
++	if (IS_ERR(n->ahb) || IS_ERR(n->mod))
++		return -EPROBE_DEFER;
++	n->rst_ahb = devm_reset_control_get_exclusive(dev, "ahb");
++	n->rst_mod = devm_reset_control_get_exclusive(dev, "mod");
++	if (IS_ERR(n->rst_ahb) || IS_ERR(n->rst_mod))
++		return dev_err_probe(dev, -ENODEV, "resets missing\n");
++	if (clk_get_rate(n->mod) > 800000000)
++		return dev_err_probe(dev, -EINVAL, "npu clock %lu Hz too fast\n",
++				     clk_get_rate(n->mod));
++
++	ret = of_reserved_mem_device_init(dev);
++	if (ret && ret != -ENODEV)
++		dev_warn(dev, "no reserved memory (%d), using default CMA\n", ret);
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(n->ahb);
++	ret = ret ?: clk_prepare_enable(n->mod);
++	if (ret)
++		return ret;
++	npu_reset_pulse(n);
++
++	n->misc.minor = MISC_DYNAMIC_MINOR;
++	n->misc.name = "npu";
++	n->misc.fops = &npu_fops;
++	n->misc.parent = dev;
++	ret = misc_register(&n->misc);
++	if (ret) {
++		reset_control_assert(n->rst_mod);
++		reset_control_assert(n->rst_ahb);
++		clk_disable_unprepare(n->mod);
++		clk_disable_unprepare(n->ahb);
++		return ret;
++	}
++	dev_info(dev, "NPU at %pa, %lu Hz, hw version %08x\n", &n->phys,
++		 clk_get_rate(n->mod), readl(n->base + 0x1000));
++	return 0;
++}
++
++static void npu_remove(struct platform_device *pdev)
++{
++	struct npu_dev *n = platform_get_drvdata(pdev);
++
++	misc_deregister(&n->misc);
++	reset_control_assert(n->rst_mod);
++	reset_control_assert(n->rst_ahb);
++	clk_disable_unprepare(n->mod);
++	clk_disable_unprepare(n->ahb);
++	of_reserved_mem_device_release(&pdev->dev);
++}
++
++static const struct of_device_id npu_of[] = {
++	{ .compatible = "allwinner,sun8i-v831-npu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, npu_of);
++
++static struct platform_driver npu_driver = {
++	.probe = npu_probe,
++	.remove = npu_remove,
++	.driver = { .name = "sun8i-npu", .of_match_table = npu_of },
++};
++module_platform_driver(npu_driver);
++
++MODULE_DESCRIPTION("Allwinner V831 NPU (NVDLA nv_small) minimal driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/linux/sun8i-npu.h b/include/uapi/linux/sun8i-npu.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d36bb976043afe968fc997169d7e8f824288198b
+--- /dev/null
++++ b/include/uapi/linux/sun8i-npu.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * /dev/npu: Allwinner V831 NPU (NVDLA nv_small based), minimal uAPI.
++ *
++ * mmap offset 0, length NPU_REG_SIZE: the register window (uncached).
++ * ALLOC returns a physically contiguous buffer: its bus address (what the
++ * NPU is programmed with) and an mmap offset for CPU access.
++ */
++#ifndef _UAPI_LINUX_SUN8I_NPU_H
++#define _UAPI_LINUX_SUN8I_NPU_H
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define NPU_REG_SIZE	0x20000
++
++struct npu_alloc {
++	__u32 size;		/* in: bytes */
++	__u32 handle;		/* out */
++	__u64 dma_addr;		/* out: address for the NPU */
++	__u64 mmap_offset;	/* out: offset for mmap() on /dev/npu */
++};
++
++struct npu_wait {
++	__u32 mask;		/* in: status bits (GLB 0x100c) that must all be set */
++	__u32 timeout_ms;	/* in */
++	__u32 status;		/* out: status register when done (or at timeout) */
++	__u32 elapsed_us;	/* out */
++};
++
++#define NPU_IOC_ALLOC	_IOWR('N', 0, struct npu_alloc)
++#define NPU_IOC_FREE	_IOW('N', 1, __u32)		/* handle */
++#define NPU_IOC_RESET	_IO('N', 2)			/* pulse both resets */
++#define NPU_IOC_SET_RATE _IOW('N', 3, __u32)		/* Hz */
++#define NPU_IOC_GET_RATE _IOR('N', 4, __u32)
++#define NPU_IOC_WAIT	_IOWR('N', 5, struct npu_wait)	/* poll status, then clear it */
++
++#endif

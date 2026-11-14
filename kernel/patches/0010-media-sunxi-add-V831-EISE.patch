@@ -1,0 +1,558 @@
+Subject: [PATCH] media: sunxi: add V831 EISE lens-distortion correction driver
+
+/dev/eise: NV12 dmabuf -> dmabuf resampling through a per-tile mesh from
+userspace. Register programming worked out on hardware.
+
+---
+ drivers/media/platform/sunxi/sun8i-eise/Kconfig   |  13 +
+ drivers/media/platform/sunxi/sun8i-eise/Makefile  |   3 +
+ .../media/platform/sunxi/sun8i-eise/sun8i_eise.c  | 468 ++++++++++++++++++++
+ include/uapi/linux/sun8i-eise.h                   |  38 ++
+ 4 files changed, 522 insertions(+)
+
+diff --git a/drivers/media/platform/sunxi/sun8i-eise/Kconfig b/drivers/media/platform/sunxi/sun8i-eise/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff942652b2e564e966a6889d83ff3a536e39990e
+--- /dev/null
++++ b/drivers/media/platform/sunxi/sun8i-eise/Kconfig
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: GPL-2.0
++config VIDEO_SUN8I_EISE
++	tristate "Allwinner V831 EISE lens distortion correction"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on COMMON_CLK && RESET_CONTROLLER && HAS_DMA
++	select DMA_SHARED_BUFFER
++	help
++	  Minimal /dev/eise driver for the V831 EISE engine: resamples NV12
++	  frames between dmabufs through a per-tile mesh supplied by
++	  userspace (fisheye correction).
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called sun8i-eise.
+diff --git a/drivers/media/platform/sunxi/sun8i-eise/Makefile b/drivers/media/platform/sunxi/sun8i-eise/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..9615020e32ac591cc0e4fdc411e343a5e738e55f
+--- /dev/null
++++ b/drivers/media/platform/sunxi/sun8i-eise/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_VIDEO_SUN8I_EISE) += sun8i-eise.o
++sun8i-eise-y := sun8i_eise.o
+diff --git a/drivers/media/platform/sunxi/sun8i-eise/sun8i_eise.c b/drivers/media/platform/sunxi/sun8i-eise/sun8i_eise.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8909bd7a7a3b4deb9ef3ce46a920b5d3ecb81b18
+--- /dev/null
++++ b/drivers/media/platform/sunxi/sun8i-eise/sun8i_eise.c
+@@ -0,0 +1,468 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner V831 EISE lens-distortion correction (LDC) engine, minimal driver.
++ *
++ * The engine resamples an NV12 frame through a per-tile mesh: for every 32x32
++ * output tile an 8x8 grid of source coordinates (1/16 px) plus the source
++ * bounding box of the tile. Register programming and table layout were worked
++ * out on hardware; the tables come from userspace.
++ *
++ * Userspace passes dmabufs (camera buffers) per job, so frames go camera ->
++ * EISE -> encoder without CPU copies. One job at a time; poll() reports
++ * completion, EISE_IOC_WAIT collects it.
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/poll.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++
++#include <linux/sun8i-eise.h>
++
++#define EISE_CTRL		0x00
++#define EISE_ICFG		0x04
++#define EISE_OCFG		0x08
++#define EISE_INT_EN		0x0c
++#define EISE_INT_STATUS		0x10
++#define EISE_ERROR		0x14
++#define EISE_MESH_ADDR		0x18
++#define EISE_BBOX_ADDR		0x1c
++#define EISE_IN_Y_ADDR		0x20
++#define EISE_IN_C_ADDR		0x24
++#define EISE_IN_SIZE		0x28
++#define EISE_OUT_Y_ADDR		0x2c
++#define EISE_OUT_C_ADDR		0x30
++#define EISE_OUT_SIZE		0x38
++#define EISE_TIMEOUT		0x3c
++#define EISE_RESET		0x88
++#define EISE_REG_124		0x124
++
++#define EISE_INT_DONE		BIT(0)
++#define EISE_INT_ALL		0x7
++
++#define EISE_MAX_W		1920
++#define EISE_MAX_H		1088
++
++struct eise_buf {
++	struct dma_buf *dbuf;
++	struct dma_buf_attachment *att;
++	struct sg_table *sgt;
++	dma_addr_t addr;
++};
++
++struct eise_dev {
++	struct device *dev;
++	struct miscdevice misc;
++	void __iomem *base;
++	struct clk *ahb, *mod, *ram;
++	struct reset_control *rst;
++	int irq;
++
++	struct mutex lock;		/* ioctl serialisation */
++	wait_queue_head_t wq;
++	bool busy, done;		/* job running / finished, not collected */
++	u32 status, error;
++	ktime_t t_start, t_end;
++	struct eise_buf in, out;
++
++	unsigned int w, h, tiles;
++	size_t mesh_size, bbox_size;
++	void *mesh, *bbox;
++	dma_addr_t mesh_dma, bbox_dma;
++	bool open;
++};
++
++static void eise_buf_put(struct eise_dev *e, struct eise_buf *b)
++{
++	if (b->sgt)
++		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_BIDIRECTIONAL);
++	if (b->att)
++		dma_buf_detach(b->dbuf, b->att);
++	if (b->dbuf)
++		dma_buf_put(b->dbuf);
++	memset(b, 0, sizeof(*b));
++}
++
++static int eise_buf_get(struct eise_dev *e, struct eise_buf *b, int fd, size_t need)
++{
++	int ret;
++
++	b->dbuf = dma_buf_get(fd);
++	if (IS_ERR(b->dbuf)) {
++		ret = PTR_ERR(b->dbuf);
++		b->dbuf = NULL;
++		return ret;
++	}
++	if (b->dbuf->size < need) {
++		ret = -EINVAL;
++		goto err;
++	}
++	b->att = dma_buf_attach(b->dbuf, e->dev);
++	if (IS_ERR(b->att)) {
++		ret = PTR_ERR(b->att);
++		b->att = NULL;
++		goto err;
++	}
++	b->sgt = dma_buf_map_attachment_unlocked(b->att, DMA_BIDIRECTIONAL);
++	if (IS_ERR(b->sgt)) {
++		ret = PTR_ERR(b->sgt);
++		b->sgt = NULL;
++		goto err;
++	}
++	/* the engine has no MMU: the buffer must be one contiguous range */
++	if (b->sgt->nents != 1) {
++		ret = -EINVAL;
++		goto err;
++	}
++	b->addr = sg_dma_address(b->sgt->sgl);
++	return 0;
++err:
++	eise_buf_put(e, b);
++	return ret;
++}
++
++static void eise_reset_engine(struct eise_dev *e)
++{
++	writel(1, e->base + EISE_RESET);
++	writel(0, e->base + EISE_RESET);
++}
++
++static irqreturn_t eise_irq(int irq, void *data)
++{
++	struct eise_dev *e = data;
++	u32 st = readl(e->base + EISE_INT_STATUS);
++
++	if (!(st & EISE_INT_ALL))
++		return IRQ_NONE;
++	writel(EISE_INT_ALL, e->base + EISE_INT_STATUS);
++	if (!e->busy)
++		return IRQ_HANDLED;
++	e->status = st;
++	e->error = readl(e->base + EISE_ERROR);
++	e->t_end = ktime_get();
++	e->busy = false;
++	e->done = true;
++	wake_up_interruptible(&e->wq);
++	return IRQ_HANDLED;
++}
++
++static void eise_free_tables(struct eise_dev *e)
++{
++	if (e->mesh)
++		dma_free_coherent(e->dev, e->mesh_size, e->mesh, e->mesh_dma);
++	if (e->bbox)
++		dma_free_coherent(e->dev, e->bbox_size, e->bbox, e->bbox_dma);
++	e->mesh = e->bbox = NULL;
++	e->w = e->h = 0;
++}
++
++static long eise_set_tables(struct eise_dev *e, void __user *arg)
++{
++	struct eise_tables t;
++	unsigned int tiles;
++
++	if (copy_from_user(&t, arg, sizeof(t)))
++		return -EFAULT;
++	if (!t.width || !t.height || t.width % 8 || t.height % 8 ||
++	    t.width > EISE_MAX_W || t.height > EISE_MAX_H)
++		return -EINVAL;
++	tiles = DIV_ROUND_UP(t.width, 32) * DIV_ROUND_UP(t.height, 32);
++	if (t.mesh_size != tiles * 0x200 || t.bbox_size != tiles * 0x20)
++		return -EINVAL;
++	if (e->busy)
++		return -EBUSY;
++	if (t.width != e->w || t.height != e->h) {
++		eise_free_tables(e);
++		e->mesh_size = PAGE_ALIGN(t.mesh_size);
++		e->bbox_size = PAGE_ALIGN(t.bbox_size);
++		e->mesh = dma_alloc_coherent(e->dev, e->mesh_size, &e->mesh_dma, GFP_KERNEL);
++		e->bbox = dma_alloc_coherent(e->dev, e->bbox_size, &e->bbox_dma, GFP_KERNEL);
++		if (!e->mesh || !e->bbox) {
++			eise_free_tables(e);
++			return -ENOMEM;
++		}
++	}
++	if (copy_from_user(e->mesh, u64_to_user_ptr(t.mesh_ptr), t.mesh_size) ||
++	    copy_from_user(e->bbox, u64_to_user_ptr(t.bbox_ptr), t.bbox_size)) {
++		eise_free_tables(e);
++		return -EFAULT;
++	}
++	e->w = t.width;
++	e->h = t.height;
++	e->tiles = tiles;
++	dev_info(e->dev, "tables %ux%u, %u tiles (mesh %pad, bbox %pad)\n", e->w, e->h,
++		 tiles, &e->mesh_dma, &e->bbox_dma);
++	return 0;
++}
++
++static long eise_run(struct eise_dev *e, void __user *arg)
++{
++	struct eise_job j;
++	void __iomem *b = e->base;
++	size_t need_in, need_out;
++	int ret;
++
++	if (copy_from_user(&j, arg, sizeof(j)))
++		return -EFAULT;
++	if (!e->mesh)
++		return -ENODATA;
++	if (e->busy || e->done)
++		return -EBUSY;
++	if (j.in_stride < e->w || j.out_stride < e->w || j.in_stride % 8 ||
++	    j.out_stride % 32 || j.in_stride / 8 > 0xfff || j.out_stride / 8 > 0xfff)
++		return -EINVAL;
++	need_in = (size_t)j.in_c_offset + (size_t)j.in_stride * e->h / 2;
++	need_out = (size_t)j.out_c_offset + (size_t)j.out_stride * e->h / 2;
++	if (j.in_c_offset < j.in_stride * e->h || j.out_c_offset < j.out_stride * e->h)
++		return -EINVAL;
++
++	ret = eise_buf_get(e, &e->in, j.in_fd, need_in);
++	if (ret)
++		return ret;
++	ret = eise_buf_get(e, &e->out, j.out_fd, need_out);
++	if (ret) {
++		eise_buf_put(e, &e->in);
++		return ret;
++	}
++
++	writel(EISE_INT_ALL, b + EISE_INT_STATUS);
++	writel(0xffff4e20, b + EISE_TIMEOUT);
++	writel(e->h << 16 | e->w, b + EISE_IN_SIZE);
++	writel(0, b + EISE_REG_124);
++	writel(e->h << 16 | e->w, b + EISE_OUT_SIZE);
++	writel((j.in_stride / 8) << 16 | (j.in_stride / 8), b + EISE_ICFG);
++	writel((j.out_stride / 8) << 20 | (j.out_stride / 8) << 8, b + EISE_OCFG);
++	writel(EISE_INT_ALL, b + EISE_INT_EN);
++	writel(e->mesh_dma, b + EISE_MESH_ADDR);
++	writel(e->bbox_dma, b + EISE_BBOX_ADDR);
++	writel(e->in.addr, b + EISE_IN_Y_ADDR);
++	writel(e->in.addr + j.in_c_offset, b + EISE_IN_C_ADDR);
++	writel(e->out.addr, b + EISE_OUT_Y_ADDR);
++	writel(e->out.addr + j.out_c_offset, b + EISE_OUT_C_ADDR);
++	e->busy = true;
++	e->done = false;
++	e->t_start = ktime_get();
++	writel(1, b + EISE_CTRL);
++	return 0;
++}
++
++static long eise_wait(struct eise_dev *e, struct file *f, void __user *arg)
++{
++	struct eise_result r = { };
++	long t;
++
++	if (!e->busy && !e->done)
++		return -ENOENT;
++	if (!e->done && (f->f_flags & O_NONBLOCK))
++		return -EAGAIN;
++	t = wait_event_interruptible_timeout(e->wq, e->done, msecs_to_jiffies(200));
++	if (t < 0)
++		return t;
++	if (!t) {
++		/* engine stuck: reset it and fail the job */
++		disable_irq(e->irq);
++		e->busy = false;
++		eise_reset_engine(e);
++		writel(EISE_INT_ALL, e->base + EISE_INT_STATUS);
++		enable_irq(e->irq);
++		r.timeout = 1;
++		r.status = e->status = 0;
++		dev_warn(e->dev, "timeout, engine reset\n");
++	} else {
++		r.status = e->status;
++		r.error = e->error;
++		r.time_us = ktime_us_delta(e->t_end, e->t_start);
++		if (r.status & ~EISE_INT_DONE)
++			eise_reset_engine(e);
++	}
++	e->done = false;
++	eise_buf_put(e, &e->in);
++	eise_buf_put(e, &e->out);
++	return copy_to_user(arg, &r, sizeof(r)) ? -EFAULT : 0;
++}
++
++static long eise_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct eise_dev *e = container_of(f->private_data, struct eise_dev, misc);
++	void __user *p = (void __user *)arg;
++	long ret;
++
++	/* one user (open is exclusive); WAIT may sleep for up to 200 ms */
++	mutex_lock(&e->lock);
++	switch (cmd) {
++	case EISE_IOC_WAIT:
++		ret = eise_wait(e, f, p);
++		break;
++	case EISE_IOC_SET_TABLES:
++		ret = eise_set_tables(e, p);
++		break;
++	case EISE_IOC_RUN:
++		ret = eise_run(e, p);
++		break;
++	default:
++		ret = -ENOTTY;
++	}
++	mutex_unlock(&e->lock);
++	return ret;
++}
++
++static __poll_t eise_poll(struct file *f, poll_table *wait)
++{
++	struct eise_dev *e = container_of(f->private_data, struct eise_dev, misc);
++
++	poll_wait(f, &e->wq, wait);
++	return READ_ONCE(e->done) ? EPOLLIN | EPOLLRDNORM : 0;
++}
++
++static int eise_open(struct inode *inode, struct file *f)
++{
++	struct eise_dev *e = container_of(f->private_data, struct eise_dev, misc);
++	int ret = 0;
++
++	mutex_lock(&e->lock);
++	if (e->open)
++		ret = -EBUSY;
++	e->open = !ret;
++	mutex_unlock(&e->lock);
++	return ret;
++}
++
++static int eise_release(struct inode *inode, struct file *f)
++{
++	struct eise_dev *e = container_of(f->private_data, struct eise_dev, misc);
++
++	mutex_lock(&e->lock);
++	if (e->busy || e->done) {
++		/* finish (or reset) a pending job before dropping its buffers */
++		wait_event_timeout(e->wq, e->done, msecs_to_jiffies(200));
++		disable_irq(e->irq);
++		if (!e->done)
++			eise_reset_engine(e);
++		e->busy = e->done = false;
++		enable_irq(e->irq);
++		eise_buf_put(e, &e->in);
++		eise_buf_put(e, &e->out);
++	}
++	eise_free_tables(e);
++	e->open = false;
++	mutex_unlock(&e->lock);
++	return 0;
++}
++
++static const struct file_operations eise_fops = {
++	.owner = THIS_MODULE,
++	.open = eise_open,
++	.release = eise_release,
++	.unlocked_ioctl = eise_ioctl,
++	.poll = eise_poll,
++	.llseek = noop_llseek,
++};
++
++static int eise_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct eise_dev *e;
++	int ret;
++
++	e = devm_kzalloc(dev, sizeof(*e), GFP_KERNEL);
++	if (!e)
++		return -ENOMEM;
++	e->dev = dev;
++	mutex_init(&e->lock);
++	init_waitqueue_head(&e->wq);
++	platform_set_drvdata(pdev, e);
++
++	e->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(e->base))
++		return PTR_ERR(e->base);
++	e->irq = platform_get_irq(pdev, 0);
++	if (e->irq < 0)
++		return e->irq;
++	e->ahb = devm_clk_get(dev, "ahb");
++	e->mod = devm_clk_get(dev, "mod");
++	e->ram = devm_clk_get(dev, "ram");
++	if (IS_ERR(e->ahb) || IS_ERR(e->mod) || IS_ERR(e->ram))
++		return -EPROBE_DEFER;
++	e->rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(e->rst))
++		return PTR_ERR(e->rst);
++	if (clk_get_rate(e->mod) > 400000000)
++		return dev_err_probe(dev, -EINVAL, "mod clock %lu Hz too fast\n",
++				     clk_get_rate(e->mod));
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = reset_control_assert(e->rst);
++	ret = ret ?: clk_prepare_enable(e->ahb);
++	ret = ret ?: clk_prepare_enable(e->ram);
++	ret = ret ?: clk_prepare_enable(e->mod);
++	ret = ret ?: reset_control_deassert(e->rst);
++	if (ret)
++		return ret;
++	udelay(10);
++	writel(0, e->base + EISE_INT_EN);
++	writel(EISE_INT_ALL, e->base + EISE_INT_STATUS);
++
++	ret = devm_request_irq(dev, e->irq, eise_irq, 0, dev_name(dev), e);
++	if (ret)
++		goto err_clk;
++
++	e->misc.minor = MISC_DYNAMIC_MINOR;
++	e->misc.name = "eise";
++	e->misc.fops = &eise_fops;
++	e->misc.parent = dev;
++	ret = misc_register(&e->misc);
++	if (ret)
++		goto err_clk;
++	dev_info(dev, "EISE LDC ready, %lu Hz\n", clk_get_rate(e->mod));
++	return 0;
++
++err_clk:
++	reset_control_assert(e->rst);
++	clk_disable_unprepare(e->mod);
++	clk_disable_unprepare(e->ram);
++	clk_disable_unprepare(e->ahb);
++	return ret;
++}
++
++static void eise_remove(struct platform_device *pdev)
++{
++	struct eise_dev *e = platform_get_drvdata(pdev);
++
++	misc_deregister(&e->misc);
++	writel(0, e->base + EISE_INT_EN);
++	reset_control_assert(e->rst);
++	clk_disable_unprepare(e->mod);
++	clk_disable_unprepare(e->ram);
++	clk_disable_unprepare(e->ahb);
++}
++
++static const struct of_device_id eise_of[] = {
++	{ .compatible = "allwinner,sun8i-v831-eise" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, eise_of);
++
++static struct platform_driver eise_driver = {
++	.probe = eise_probe,
++	.remove = eise_remove,
++	.driver = { .name = "sun8i-eise", .of_match_table = eise_of },
++};
++module_platform_driver(eise_driver);
++
++MODULE_DESCRIPTION("Allwinner V831 EISE lens distortion correction");
++MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("DMA_BUF");
+diff --git a/include/uapi/linux/sun8i-eise.h b/include/uapi/linux/sun8i-eise.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa152fd2d10099f712880780c1f4549199e553ef
+--- /dev/null
++++ b/include/uapi/linux/sun8i-eise.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * /dev/eise: Allwinner V831 EISE lens-distortion correction (LDC), minimal uAPI.
++ *
++ *   SET_TABLES  load the per-32x32-tile mesh (0x200 B/tile) and bounding-box
++ *               (0x20 B/tile) tables for a W x H output
++ *   RUN         start one frame: NV12 dmabuf in -> NV12 dmabuf out (async)
++ *   WAIT        collect the result; poll() reports POLLIN when a job finished
++ */
++#ifndef _UAPI_LINUX_SUN8I_EISE_H
++#define _UAPI_LINUX_SUN8I_EISE_H
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++struct eise_tables {
++	__u32 width, height;		/* frame size (multiple of 8, <= 1920x1080) */
++	__u32 mesh_size, bbox_size;	/* bytes: tiles * 0x200, tiles * 0x20 */
++	__u64 mesh_ptr, bbox_ptr;	/* user pointers */
++};
++
++struct eise_job {
++	__s32 in_fd, out_fd;		/* dmabufs (NV12, Y then interleaved CbCr) */
++	__u32 in_stride, out_stride;	/* bytes per line (Y and C) */
++	__u32 in_c_offset, out_c_offset;/* byte offset of the CbCr plane */
++};
++
++struct eise_result {
++	__u32 status;			/* INT_STATUS: bit0 done, bit1/2 error */
++	__u32 error;			/* ERROR register */
++	__u32 time_us;			/* start -> interrupt */
++	__u32 timeout;			/* 1 if the engine did not finish */
++};
++
++#define EISE_IOC_SET_TABLES	_IOW('E', 0, struct eise_tables)
++#define EISE_IOC_RUN		_IOW('E', 1, struct eise_job)
++#define EISE_IOC_WAIT		_IOR('E', 2, struct eise_result)
++
++#endif

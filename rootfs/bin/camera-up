@@ -1,0 +1,73 @@
+#!/bin/sh
+# Load the camera + encoder drivers and keep the RTSP server running.
+# Stream: rtsp://<camera>/main  (H.264, see /etc/camera.conf)
+B=/bin/busybox
+log() { echo "[camera-up $($B cut -d' ' -f1 /proc/uptime)] $*"; }
+CAMRTSP_ARGS="-s 1920x1080 -f 30 -q 30 -g 60 -a 70 -F 50 -G 16"
+VIN_ARGS=""
+ONVIF_ARGS=""
+PERSOND=0
+PERSOND_ARGS=""
+[ -f /etc/camera.conf ] && . /etc/camera.conf
+
+# Let the Wi-Fi driver (2 MiB module) load first: loading both stacks at once
+# ran the 64 MiB board out of memory during boot.
+i=0
+while [ $i -lt 25 ] && ! $B grep -q '^8189fs ' /proc/modules; do $B sleep 1; i=$((i + 1)); done
+log "wifi driver ready after ${i}s"
+
+for m in v4l2-cci gc3003 sun8i_v831_vin cedrus-enc industrialio-adc sun20i-gpadc-iio \
+         sun8i-v831-codec sun8i-eise; do
+    a=""; [ $m = sun8i_v831_vin ] && a="$VIN_ARGS"
+    $B insmod /lib/modules/$m.ko $a || log "insmod $m failed"
+done
+log "drivers loaded"
+
+# The Wi-Fi module file is only needed until it is loaded; it costs 1.4 MiB
+# of RAM in the initramfs.
+( i=0; while [ $i -lt 60 ] && ! $B grep -q '^8189fs ' /proc/modules; do
+      $B sleep 1; i=$((i + 1)); done
+  $B grep -q '^8189fs ' /proc/modules && $B rm -f /lib/modules/8189fs.ko ) &
+
+[ "$PERSOND" = 1 ] && { $B insmod /lib/modules/sun8i-npu.ko || log "insmod sun8i-npu failed"; }
+
+# Person detector on the NPU. The 1.9 MB model lives on the SD card (an
+# initramfs copy would stay in RAM): mounted read-only just until persond has
+# loaded it (persond writes /tmp/person.state once loaded). Respawned; it waits
+# for camrtsp's /tmp/detframe by itself.
+if [ "$PERSOND" = 1 ] && [ -c /dev/npu ]; then
+  ( while :; do
+        $B rm -f /tmp/person.state
+        $B mkdir -p /sdnpu
+        if ! $B mount -t vfat -o ro /dev/mmcblk0p1 /sdnpu; then
+            log "persond: SD card not mounted, retry in 30 s"; $B sleep 30; continue
+        fi
+        /bin/persond -m /sdnpu/yolov5n.nnp $PERSOND_ARGS > /tmp/persond.log 2>&1 &
+        p=$!; i=0
+        while [ $i -lt 30 ] && [ ! -f /tmp/person.state ] && $B kill -0 $p 2>/dev/null; do
+            $B sleep 1; i=$((i + 1)); done
+        $B umount /sdnpu
+        echo 1 > /proc/sys/vm/drop_caches
+        wait $p
+        log "persond exited ($?), restarting in 10 s"
+        $B tail -5 /tmp/persond.log
+        $B sleep 10
+    done ) &
+fi
+
+# ONVIF (discovery + device/media services on port 80); separate process so a
+# bad request can never take the stream down
+( while :; do
+      /bin/onvifd $ONVIF_ARGS $CAMRTSP_ARGS > /tmp/onvifd.log 2>&1
+      log "onvifd exited ($?), restarting in 5 s"
+      $B sleep 5
+  done ) &
+
+while :; do
+    log "starting camrtsp $CAMRTSP_ARGS"
+    # never let the OOM killer pick the streamer (Wi-Fi bring-up spikes)
+    ( echo -900 > /proc/self/oom_score_adj; exec /bin/camrtsp $CAMRTSP_ARGS ) > /tmp/camrtsp.log 2>&1
+    log "camrtsp exited ($?), restarting in 2 s"
+    $B cat /tmp/camrtsp.log
+    $B sleep 2
+done

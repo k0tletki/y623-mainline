@@ -1,0 +1,3 @@
+#!/bin/sh
+# Kept for deploy.sh and old habits: plain "reboot" does the same now.
+exec /bin/busybox reboot

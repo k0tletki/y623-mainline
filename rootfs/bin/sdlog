@@ -1,0 +1,13 @@
+#!/bin/sh
+# sdlog NAME : copy /tmp/wifi.log + dmesg (+ extra stdin) to the SD card as NAME
+B=/bin/busybox
+name=$1
+$B mkdir -p /mnt
+$B mount -t vfat -o rw /dev/mmcblk0p1 /mnt 2>/dev/null || exit 1
+{
+    $B cat
+    echo "=== wifi-up log ==="; $B cat /tmp/wifi.log 2>/dev/null
+    echo "=== dmesg ==="; /bin/dmesg
+} > /mnt/$name
+$B sync
+$B umount /mnt

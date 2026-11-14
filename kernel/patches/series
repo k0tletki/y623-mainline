@@ -1,0 +1,15 @@
+0001-dt-bindings-sunxi-add-V831-V833-compatibles.patch
+0002-clk-sunxi-ng-add-V833-CCU.patch
+0003-pinctrl-sunxi-add-V83x.patch
+0004-rtc-sun6i-add-V831.patch
+0005-iommu-sun50i-V831-and-per-master-bypass.patch
+0006-ARM-sunxi-add-V831-machine-compatible.patch
+0007-media-i2c-add-gc3003.patch
+0008-media-sunxi-add-V831-VIN-ISP.patch
+0009-media-sunxi-add-cedrus-enc.patch
+0010-media-sunxi-add-V831-EISE.patch
+0011-media-sunxi-build-V831-drivers.patch
+0012-misc-add-sun8i-npu.patch
+0013-ASoC-sunxi-add-V831-codec.patch
+0014-ARM-dts-sunxi-add-V831-and-Yi-Y623.patch
+0015-ARM-configs-add-y623_min_defconfig.patch

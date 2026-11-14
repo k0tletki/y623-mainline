@@ -1,0 +1,36 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+/bin/busybox mkdir -p /dev/pts /tmp /var/run
+/bin/busybox mount -t devpts devpts /dev/pts
+/bin/busybox mount -t tmpfs tmpfs /tmp
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+# keep running after a driver oops so the trace can be read over ssh
+echo 0 > /proc/sys/kernel/panic_on_oops
+# 64 MiB board with a big CMA pool: kernel watermark boosting (+4 MiB to the
+# free-page minimum after fragmentation events) OOM-killed processes with
+# ~3.5 MiB of ordinary memory still free. Turn it off.
+echo 0 > /proc/sys/vm/watermark_boost_factor
+# hardware watchdog: a hang warm-resets the SoC, keeping ramoops in DRAM
+/bin/wdog 10
+echo "===V831-SD-BOOT-OK==="
+/bin/busybox cat /proc/version
+# bootlog (kernel log + pstore to the SD card) runs from wifi-up once the
+# network is up: it used to cost 2 s here, and both use the SD mount.
+/bin/wifi-up > /tmp/wifi.log 2>&1 &
+/bin/camera-up > /tmp/camera.log 2>&1 &
+# No interactive shell on ttyS0: with RX floating, sh executed line noise
+# (and its tty buffering OOM'd the board). Use SSH; add "consoleshell" to the
+# kernel command line to get it back when a serial adapter is attached.
+if /bin/busybox grep -qw consoleshell /proc/cmdline; then
+	echo "===SHELL==="
+	exec /bin/sh
+fi
+echo "===NO-CONSOLE-SHELL==="
+# PID 1: busybox reboot/poweroff/halt only signal init (TERM/USR2/USR1);
+# do an orderly shutdown on those. "sleep & wait" lets the traps run at once.
+exec /bin/busybox sh -c 'trap "exec /bin/shutdown-now reboot" TERM INT
+trap "exec /bin/shutdown-now poweroff" USR2
+trap "exec /bin/shutdown-now halt" USR1
+while :; do /bin/busybox sleep 3600 & wait $!; done' </dev/null

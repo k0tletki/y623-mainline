@@ -1,0 +1,91 @@
+#!/bin/sh
+# Bring up RTL8189FS on mmc1, join the network from /etc/wpa_supplicant.conf,
+# DHCP, start dropbear, then write WIFILOG.TXT to the SD card.
+B=/bin/busybox
+log() { echo "[wifi-up $($B cut -d' ' -f1 /proc/uptime)] $*"; }
+
+log "waiting for SDIO function"
+i=0
+while [ $i -lt 20 ] && ! $B ls /sys/bus/sdio/devices/ 2>/dev/null | $B grep -q .; do
+    $B sleep 1; i=$((i + 1))
+done
+$B ls -l /sys/bus/sdio/devices/
+
+echo "stage: before insmod" | /bin/sdlog WIFILOG.TXT
+log "insmod 8189fs"
+# The 2 MiB driver lives on the SD card, not in the initramfs: as reclaimable
+# page cache it does not use the scarce unmovable RAM (an initramfs copy plus
+# the kernel's load buffer OOM-killed boot processes).
+if [ -f /lib/modules/8189fs.ko ]; then
+    $B insmod /lib/modules/8189fs.ko rtw_power_mgnt=0 rtw_ips_mode=0
+    rc=$?
+else
+    rc=1; i=0
+    while [ $i -lt 10 ] && [ ! -b /dev/mmcblk0p1 ]; do $B sleep 1; i=$((i + 1)); done
+    if $B mount -t vfat -o ro /dev/mmcblk0p1 /mnt; then
+        $B insmod /mnt/8189fs.ko rtw_power_mgnt=0 rtw_ips_mode=0
+        rc=$?
+        $B umount /mnt
+    fi
+    echo 3 > /proc/sys/vm/drop_caches
+fi
+log "insmod rc=$rc"
+echo "stage: after insmod" | /bin/sdlog WIFILOG.TXT
+
+i=0
+while [ $i -lt 15 ] && [ ! -e /sys/class/net/wlan0 ]; do $B sleep 1; i=$((i + 1)); done
+if [ -e /sys/class/net/wlan0 ]; then
+    log "wlan0 present, mac $($B cat /sys/class/net/wlan0/address)"
+    $B ifconfig lo 127.0.0.1 up
+    $B ifconfig wlan0 up
+    # no -dd: the log lives in RAM and the camera runs for weeks
+    /bin/wpa_supplicant -Dwext -iwlan0 -c/etc/wpa_supplicant.conf > /tmp/wpa.log 2>&1 &
+    log "wpa_supplicant started"
+    echo "stage: wpa started" | /bin/sdlog WIFILOG.TXT
+    # udhcpc retries until it gets a lease; -n -q gives up after the timeout.
+    # The first DISCOVERs go out before association completes and are lost:
+    # retry every second rather than every 3 s.
+    if $B udhcpc -i wlan0 -O ntpsrv -s /usr/share/udhcpc/default.script -t 30 -T 1 -n -q; then
+        log "DHCP OK: $($B ifconfig wlan0 | $B grep 'inet addr')"
+        # keep renewing the lease (the probe above quits after the first one)
+        $B udhcpc -i wlan0 -O ntpsrv -s /usr/share/udhcpc/default.script -b -t 0 -T 5 > /dev/null 2>&1
+        /bin/dropbear -r /etc/dropbear/dropbear_ed25519_host_key -p 22 -s
+        log "dropbear started on port 22 (key auth only)"
+        # clock (ONVIF clients and logs want real time): DHCP NTP server or pool
+        ntp=""
+        for n in $($B cat /tmp/ntp.servers 2>/dev/null) pool.ntp.org; do ntp="$ntp -p $n"; done
+        $B ntpd $ntp
+        log "ntpd started ($ntp)"
+        /bin/ledblink 237 5 100
+    else
+        log "DHCP failed"
+        # stop wpa_supplicant so its buffered stdout is flushed to /tmp/wpa.log
+        $B killall wpa_supplicant; $B sleep 2
+        /bin/ledblink 237 4 1000
+    fi
+else
+    log "no wlan0"
+    /bin/ledblink 237 4 1000
+fi
+
+# Save everything to the SD card
+$B mkdir -p /mnt
+if $B mount -t vfat -o rw /dev/mmcblk0p1 /mnt; then
+    {
+        echo "stage: done"
+        echo "=== wifi-up log ==="; $B cat /tmp/wifi.log
+        echo "=== ifconfig -a ==="; $B ifconfig -a
+        echo "=== route ==="; $B route -n
+        echo "=== resolv.conf ==="; $B cat /tmp/resolv.conf 2>/dev/null
+        echo "=== /proc/net/wireless ==="; $B cat /proc/net/wireless
+        echo "=== wpa_supplicant log (keys filtered) ==="
+        $B grep -viE 'psk|passphrase|PMK|PTK|GTK|key' /tmp/wpa.log | $B tail -300
+        echo "=== dmesg ==="; /bin/dmesg
+    } > /mnt/WIFILOG.TXT
+    $B sync; $B umount /mnt
+    log "wrote WIFILOG.TXT"
+fi
+# kernel log + previous boot's pstore to the SD card (needs /mnt free)
+/bin/bootlog
+# Safe-to-pull signal: 20 very fast blinks, then LED stays on
+/bin/ledblink 237 20 50

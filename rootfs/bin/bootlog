@@ -1,0 +1,73 @@
+#!/bin/sh
+# Save the mainline kernel log to the boot SD card (FAT partition).
+# The card must be visible as mmcblk0p1/mmcblk1p1 for this to work.
+dev=""
+i=0
+while [ $i -lt 10 ]; do
+    if [ -b /dev/mmcblk0p1 ]; then
+        dev=/dev/mmcblk0p1
+        break
+    fi
+    if [ -b /dev/mmcblk1p1 ]; then
+        dev=/dev/mmcblk1p1
+        break
+    fi
+    /bin/busybox sleep 1
+    i=$((i + 1))
+done
+
+if [ -z "$dev" ]; then
+    echo "bootlog: no mmcblk partition, skipping SD log"
+    /bin/ledblink 237 1 1000
+    exit 0
+fi
+
+/bin/busybox mkdir -p /mnt
+if ! /bin/busybox mount -t vfat -o rw "$dev" /mnt; then
+    echo "bootlog: mount $dev failed, skipping SD log"
+    /bin/ledblink 237 2 1000
+    exit 0
+fi
+
+if ! {
+    echo "=== Yi 2K Pro mainline Linux bootlog ==="
+    /bin/busybox date
+    /bin/busybox cat /proc/version
+    echo "model:"
+    /bin/busybox cat /proc/device-tree/model
+    echo
+    echo "cmdline:"
+    /bin/busybox cat /proc/cmdline
+    echo "partitions:"
+    /bin/busybox cat /proc/partitions
+    echo "sdio:"
+    for d in /sys/bus/sdio/devices/*; do
+        [ -e "$d" ] || { echo "  (none)"; break; }
+        echo "  $d vendor=$(/bin/busybox cat $d/vendor) device=$(/bin/busybox cat $d/device) class=$(/bin/busybox cat $d/class)"
+    done
+    echo "mmc hosts:"
+    /bin/busybox ls -l /sys/class/mmc_host/
+    echo "camera:"
+    /bin/busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    /bin/busybox grep -E 'csi|mclk|i2c1' /sys/kernel/debug/clk/clk_summary 2>/dev/null
+    /bin/busybox ls -l /sys/bus/i2c/devices/ 2>/dev/null
+    /bin/busybox ls /sys/bus/i2c/drivers/gc3003/ 2>/dev/null
+    echo "=== dmesg ==="
+    /bin/dmesg
+} > /mnt/BOOTLOG.TXT; then
+    echo "bootlog: write failed"
+    /bin/ledblink 237 3 1000
+    /bin/busybox umount /mnt
+    exit 0
+fi
+
+# Logs saved by ramoops from the previous (crashed/reset) boot
+/bin/busybox mkdir -p /sys/fs/pstore
+/bin/busybox mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+for f in /sys/fs/pstore/*; do
+    [ -e "$f" ] || break
+    /bin/busybox cp "$f" "/mnt/PSTORE-${f##*/}.TXT"
+done
+/bin/busybox sync
+/bin/busybox umount /mnt
+echo "bootlog: wrote $dev:/BOOTLOG.TXT"

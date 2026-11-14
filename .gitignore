@@ -1,0 +1,14 @@
+# never commit
+/secrets/
+*.key
+wpa_supplicant.conf
+authorized_keys
+# build output
+/out/
+result
+result-*
+*.o
+*.ko
+*.nnp
+*.onnx
+__pycache__/

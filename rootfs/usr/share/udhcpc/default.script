@@ -1,0 +1,16 @@
+#!/bin/sh
+B=/bin/busybox
+case "$1" in
+    deconfig) $B ifconfig "$interface" 0.0.0.0 ;;
+    bound|renew)
+        $B ifconfig "$interface" "$ip" ${subnet:+netmask $subnet} ${broadcast:+broadcast $broadcast}
+        if [ -n "$router" ]; then
+            while $B route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do :; done
+            for r in $router; do $B route add default gw "$r" dev "$interface"; break; done
+        fi
+        : > /tmp/resolv.conf
+        for d in $dns; do echo "nameserver $d" >> /tmp/resolv.conf; done
+        [ -n "$ntpsrv" ] && echo "$ntpsrv" > /tmp/ntp.servers
+        ;;
+esac
+exit 0

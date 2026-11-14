@@ -1,0 +1,780 @@
+Subject: [PATCH] ARM: dts: sunxi: add V831 SoC and Yi 2K Pro (Y623) camera
+
+V831 SoC dtsi (based on Icenowy Zheng's) and the board DT: SD card, RTL8189FS
+SDIO Wi-Fi, GC3003 sensor, IR LEDs/cut filter, codec, VE/EISE/NPU nodes and the
+reserved-memory pools (CMA pools must be 2 MiB aligned on arm32).
+
+---
+ arch/arm/boot/dts/allwinner/Makefile              |   1 +
+ .../arm/boot/dts/allwinner/sun8i-v831-yi-y623.dts | 300 +++++++++++++
+ arch/arm/boot/dts/allwinner/sun8i-v831.dtsi       | 444 ++++++++++++++++++++
+ 3 files changed, 745 insertions(+)
+
+diff --git a/arch/arm/boot/dts/allwinner/Makefile b/arch/arm/boot/dts/allwinner/Makefile
+index 75b2b6a2f7a6794c5307cc01bacdcec3f38a7cc7..4a0f8029835544e62f78f81f12d00c25c901a429 100644
+--- a/arch/arm/boot/dts/allwinner/Makefile
++++ b/arch/arm/boot/dts/allwinner/Makefile
+@@ -274,6 +274,7 @@ dtb-$(CONFIG_MACH_SUN8I) += \
+ 	sun8i-v3s-licheepi-zero.dtb \
+ 	sun8i-v3s-licheepi-zero-dock.dtb \
+ 	sun8i-v3s-netcube-kumquat.dtb \
++	sun8i-v831-yi-y623.dtb \
+ 	sun8i-v40-bananapi-m2-berry.dtb
+ sun8i-h2-plus-orangepi-zero-interface-board-dtbs += \
+ 	sun8i-h2-plus-orangepi-zero.dtb sun8i-orangepi-zero-interface-board.dtbo
+diff --git a/arch/arm/boot/dts/allwinner/sun8i-v831-yi-y623.dts b/arch/arm/boot/dts/allwinner/sun8i-v831-yi-y623.dts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e09e278ad4bd25da7dfe77166205f34b1f47165f
+--- /dev/null
++++ b/arch/arm/boot/dts/allwinner/sun8i-v831-yi-y623.dts
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Yi 2K Pro (y623) - Allwinner V831 / sun8iw19p1
++ *
++ * Phase 0: console, SD/MMC, SPI NOR and RTC/WDT only.
++ * The vendor VIN/ISP/VENC/NPU stack is not part of this DT yet.
++ */
++
++/dts-v1/;
++
++#include "sun8i-v831.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	model = "Yi 2K Pro (y623)";
++	compatible = "yi,y623", "allwinner,sun8i-v831";
++
++	aliases {
++		mmc0 = &mmc0;
++		mmc1 = &mmc1;
++		serial0 = &uart0;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		bootargs = "console=ttyS0,115200 root=/dev/mtdblock2 rootwait ro init=/bin/sh";
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x40000000 0x04000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Kept across watchdog/panic resets. 0x41c00000 is clear of the
++		 * kernel Image (ends ~0x41008000), U-Boot's zImage (0x41000000,
++		 * ~6 MiB), DTB (0x42000000), CMA/initrd (0x42800000+) and the
++		 * relocated U-Boot at the top of DRAM.
++		 */
++		/*
++		 * Camera frame buffers, as a device-private CMA area: exact-size
++		 * allocations (a no-map coherent pool rounds each ~6 MiB RAW10
++		 * frame up to 8 MiB), and the pages are lent to the system for
++		 * movable allocations while the camera is idle.
++		 */
++		vin_pool: vin-buffers {
++			compatible = "shared-dma-pool";
++			/*
++			 * 22 MiB, shared by VIN and the VE encoder at 1920x1080:
++			 * 2 NV12 camera frames (2 x 3.1 MiB) + 2 VE reconstruction
++			 * frames (2 x 3.3 MiB) + coded/small VE buffers (~1.3 MiB),
++			 * leaving room for an EISE (dewarp) frame pair. 24 MiB
++			 * (2304x1296) left too little unmovable memory: the OOM
++			 * killer took the streamer when Wi-Fi came up.
++			 */
++			size = <0x1800000>;	/* 24 MiB */
++			alignment = <0x400000>;
++			reusable;
++		};
++
++		/*
++		 * NPU weights (1.8 MiB) + activation arena (0.7 MiB) for YOLOv5n,
++		 * contiguous because the arm32 DMA layer cannot attach the shared
++		 * sun50i IOMMU group. Every CMA area must start and end on a 2 MiB
++		 * boundary: arm32 dma_contiguous_remap() clears whole PMD sections
++		 * but remaps only the area, unmapping its neighbours (early page
++		 * tables) - a 3 MiB pool or 1 MiB-aligned default CMA hung boot.
++		 * Pageblock order 10 keeps CMA 4 MiB aligned; the kernel's default
++		 * CMA is 0 (CONFIG_CMA_SIZE_MBYTES) to pay for this pool.
++		 * Fixed below ramoops, where the old default CMA lived: placed by
++		 * the kernel it landed in the top 4 MiB (0x43c00000), and then warm
++		 * reboots after the camera had streamed never came back (hardware
++		 * only; cold boots and qemu fine; old DTB + same kernel fine).
++		 */
++		npu_pool: npu-buffers@41800000 {
++			compatible = "shared-dma-pool";
++			reg = <0x41800000 0x400000>;
++			reusable;
++		};
++
++		ramoops@41c00000 {
++			compatible = "ramoops";
++			reg = <0x41c00000 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x80000>;
++			ecc-size = <16>;
++		};
++	};
++
++	/*
++	 * RTL8189FS (SDIO 024c:f179) enable line: PG6. Stock /backup/init.sh for
++	 * y623 drives gpio198 (= PG6) low for 1 s, then high, before insmod.
++	 */
++	wifi_pwrseq: pwrseq-wifi {
++		compatible = "mmc-pwrseq-simple";
++		reset-gpios = <&pio 6 6 GPIO_ACTIVE_LOW>; /* PG6 */
++		post-power-on-delay-ms = <200>;
++		power-off-delay-us = <1000>;
++	};
++
++	reg_wifi_vcc: regulator-wifi-vcc {
++		/* No switchable Wi-Fi supply known; the chip rail is always on. */
++		compatible = "regulator-fixed";
++		regulator-name = "wifi-vcc";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	reg_vcc3v3: regulator-vcc3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc3v3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		/*
++		 * SD card power switch: PC4, active low (vendor card-pwr-gpios,
++		 * ctl-spec-caps lacks CARD_PWR_GPIO_HIGH_ACTIVE). Not always-on so
++		 * the MMC core can power-cycle the card; 200 ms off time matches
++		 * the vendor time_pwroff_ms.
++		 */
++		regulator-boot-on;
++		off-on-delay-us = <200000>;
++		gpio = <&pio 2 4 GPIO_ACTIVE_LOW>;
++	};
++};
++
++&uart0 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart0_ph9_ph10_pins>;
++};
++
++&mmc0 {
++	status = "okay";
++	bus-width = <4>;
++	/* Vendor/OpenIPC U-Boot uses broken-cd: the SD card-detect line is not usable. */
++	broken-cd;
++	no-1-8-v;
++	vmmc-supply = <&reg_vcc3v3>;
++	vqmmc-supply = <&reg_vcc3v3>;
++};
++
++&codec {
++	/* speaker amplifier enable: PH14 (stock cpld_periph "speaker_en") */
++	allwinner,pa-gpios = <&pio 7 14 GPIO_ACTIVE_HIGH>;
++	allwinner,pa-delay-ms = <160>;
++	status = "okay";
++};
++
++&i2c1 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c1_pi_pins>;
++	clock-frequency = <400000>;
++
++	/*
++	 * GC3003 (vendor: twi1, address 0x6e 8-bit). MCLK is 27 MHz, as set
++	 * by the stock gc3003_mipi driver: pll-csi at the vendor's 540 MHz,
++	 * divided by 20. Reset is PI3, power-down is PI4 (both active low;
++	 * the sensor only answers on I2C with PI4 high). The datasheet claims
++	 * PI3/PI4 are V833-only, but they are present on this V831.
++	 */
++	camera@37 {
++		compatible = "galaxycore,gc3003";
++		reg = <0x37>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&csi_mclk0_pin>;
++		clocks = <&ccu CLK_CSI_MCLK0>;
++		assigned-clocks = <&ccu CLK_PLL_CSI>, <&ccu CLK_CSI_MCLK0>;
++		assigned-clock-parents = <0>, <&ccu CLK_PLL_CSI>;
++		assigned-clock-rates = <540000000>, <27000000>;
++		reset-gpios = <&pio 8 3 GPIO_ACTIVE_LOW>;	/* PI3 */
++		powerdown-gpios = <&pio 8 4 GPIO_ACTIVE_LOW>;	/* PI4 */
++		orientation = <1>; /* back */
++
++		port {
++			gc3003_out: endpoint {
++				remote-endpoint = <&vin_in>;
++				data-lanes = <1 2>;
++				link-frequencies = /bits/ 64 <315000000>;
++			};
++		};
++	};
++};
++
++&npu {
++	/* weights and feature maps: physically contiguous (no IOMMU, see dtsi) */
++	memory-region = <&npu_pool>;
++};
++
++&vin {
++	memory-region = <&vin_pool>;
++	status = "okay";
++};
++
++&vin_in {
++	remote-endpoint = <&gc3003_out>;
++	data-lanes = <1 2>;
++};
++
++&mmc1 {
++	status = "okay";
++	bus-width = <4>;
++	non-removable;
++	cap-sdio-irq;
++	keep-power-in-suspend;
++	no-1-8-v;
++	max-frequency = <50000000>; /* vendor sdc1 max-frequency */
++	mmc-pwrseq = <&wifi_pwrseq>;
++	vmmc-supply = <&reg_wifi_vcc>;
++	vqmmc-supply = <&reg_wifi_vcc>;
++};
++
++&rtc {
++	clocks = <&osc24M>;
++	status = "okay";
++};
++
++&pio {
++	/*
++	 * Single-bit NOR (vendor spi-{rx,tx}-bus-width = 1). PC4 is NOT an SPI
++	 * pin on this board: it is the SD card power switch. Muxing it to spi0
++	 * (as spi0_qspi_pins does) takes it away from the GPIO and cuts the
++	 * card's power as soon as spi0 probes.
++	 */
++	spi0_y623_pins: spi0-y623-pins {
++		pins = "PC0", "PC2", "PC3", "PC5";
++		function = "spi0";
++	};
++};
++
++&spi0 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&spi0_y623_pins>, <&spi0_cs_pin>;
++
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <12000000>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "uboot";
++				reg = <0x000000 0x060000>;
++			};
++
++			partition@60000 {
++				label = "boot";
++				reg = <0x060000 0x1d0000>;
++			};
++
++			partition@230000 {
++				label = "rootfs";
++				reg = <0x230000 0x120000>;
++			};
++
++			partition@350000 {
++				label = "home";
++				reg = <0x350000 0x340000>;
++			};
++
++			partition@690000 {
++				label = "backup";
++				reg = <0x690000 0x130000>;
++			};
++
++			partition@7c0000 {
++				label = "env";
++				reg = <0x7c0000 0x020000>;
++			};
++
++			partition@7e0000 {
++				label = "mfg";
++				reg = <0x7e0000 0x010000>;
++			};
++
++			partition@7f0000 {
++				label = "conf";
++				reg = <0x7f0000 0x010000>;
++			};
++		};
++	};
++};
++
++&ve {
++	/* VE buffers are mapped by the IOMMU but taken from the camera CMA pool */
++	memory-region = <&vin_pool>;
++};
+diff --git a/arch/arm/boot/dts/allwinner/sun8i-v831.dtsi b/arch/arm/boot/dts/allwinner/sun8i-v831.dtsi
+new file mode 100644
+index 0000000000000000000000000000000000000000..477dd9b9b5d57e9cad789c96ab885530a921c9a9
+--- /dev/null
++++ b/arch/arm/boot/dts/allwinner/sun8i-v831.dtsi
+@@ -0,0 +1,444 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (C) 2020 Icenowy Zheng <icenowy@aosc.io>
++ */
++
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/clock/sun8i-v833-ccu.h>
++#include <dt-bindings/reset/sun8i-v833-ccu.h>
++
++/ {
++	interrupt-parent = <&gic>;
++	#address-cells = <1>;
++	#size-cells = <1>;
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu@0 {
++			compatible = "arm,cortex-a7";
++			device_type = "cpu";
++			reg = <0>;
++			clocks = <&ccu CLK_CPUX>;
++		};
++	};
++
++	osc24M: osc24M_clk {
++		#clock-cells = <0>;
++		compatible = "fixed-clock";
++		clock-frequency = <24000000>;
++		clock-output-names = "osc24M";
++	};
++
++	timer {
++		compatible = "arm,armv7-timer";
++		interrupts = <GIC_PPI 13
++			(GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>,
++			     <GIC_PPI 14
++			(GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>,
++			     <GIC_PPI 11
++			(GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>,
++			     <GIC_PPI 10
++			(GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
++	};
++
++	soc {
++		compatible = "simple-bus";
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		ccu: clock@3001000 {
++			compatible = "allwinner,sun8i-v833-ccu";
++			reg = <0x03001000 0x1000>;
++			clocks = <&osc24M>, <&rtc 0>, <&rtc 2>;
++			clock-names = "hosc", "losc", "iosc";
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++		};
++
++		ve: video-codec@1c0e000 {
++			compatible = "allwinner,sun8i-v831-video-engine";
++			reg = <0x01c0e000 0x1000>,
++			      <0x03000000 0x10>;	/* SRAM ctrl (VE remap) */
++			reg-names = "ve", "sram";
++			clocks = <&ccu CLK_BUS_VE>, <&ccu CLK_VE>,
++				 <&ccu CLK_MBUS_VE>;
++			clock-names = "ahb", "mod", "ram";
++			resets = <&ccu RST_BUS_VE>;
++			interrupts = <GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH>;
++			iommus = <&iommu 3>;
++			assigned-clocks = <&ccu CLK_VE>;
++			assigned-clock-parents = <&ccu CLK_PLL_PERIPH0>;
++			assigned-clock-rates = <300000000>;
++		};
++
++		gpadc: adc@5070000 {
++			/* same IP as the D1 GPADC; channel 0 = light sensor on y623 */
++			compatible = "allwinner,sun8i-v831-gpadc",
++				     "allwinner,sun20i-d1-gpadc";
++			reg = <0x05070000 0x400>;
++			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_GPADC>;
++			resets = <&ccu RST_BUS_GPADC>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			#io-channel-cells = <1>;
++
++			channel@0 {
++				reg = <0>;
++			};
++		};
++
++		npu: npu@2400000 {
++			/* NVDLA nv_small based neural network accelerator ("NNA") */
++			compatible = "allwinner,sun8i-v831-npu";
++			reg = <0x02400000 0x20000>;
++			clocks = <&ccu CLK_BUS_NPU>, <&ccu CLK_NPU>;
++			clock-names = "ahb", "mod";
++			resets = <&ccu RST_BUS_NPU>, <&ccu RST_NPU>;
++			reset-names = "ahb", "mod";
++			interrupts = <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>;
++			/*
++			 * IOMMU master 2 (vendor DT). Not used: on arm32 the DMA layer fails to
++			 * attach devices to this IOMMU ("Failed to attached device ... to
++			 * IOMMU_mapping", VE too), so buffers come from vin_pool instead.
++			 */
++			assigned-clocks = <&ccu CLK_NPU>;
++			assigned-clock-parents = <&ccu CLK_PLL_PERIPH0_2X>;
++			assigned-clock-rates = <400000000>;
++		};
++
++		eise: image-engine@2300000 {
++			/* EISE: stabilisation + lens distortion correction (IDC/LDC) */
++			compatible = "allwinner,sun8i-v831-eise";
++			reg = <0x02300000 0x1000>;
++			clocks = <&ccu CLK_BUS_EISE>, <&ccu CLK_EISE>,
++				 <&ccu CLK_MBUS_EISE>;
++			clock-names = "ahb", "mod", "ram";
++			resets = <&ccu RST_BUS_EISE>;
++			interrupts = <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH>;
++			assigned-clocks = <&ccu CLK_EISE>;
++			assigned-clock-parents = <&ccu CLK_PLL_PERIPH0>;
++			assigned-clock-rates = <300000000>;
++		};
++
++		iommu: iommu@30f0000 {
++			compatible = "allwinner,sun8i-v831-iommu",
++				     "allwinner,sun50i-h6-iommu";
++			reg = <0x030f0000 0x1000>;
++			interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_IOMMU>;
++			resets = <&ccu RST_BUS_IOMMU>;
++			#iommu-cells = <1>;
++		};
++
++		watchdog: watchdog@30090a0 {
++			compatible = "allwinner,sun8i-v831-wdt",
++				     "allwinner,sun6i-a31-wdt";
++			reg = <0x030090a0 0x20>;
++			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&osc24M>;
++		};
++
++		dma: dma-controller@3002000 {
++			compatible = "allwinner,sun8i-v831-dma",
++				     "allwinner,sun50i-h6-dma";
++			reg = <0x03002000 0x1000>;
++			interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_DMA>, <&ccu CLK_MBUS_DMA>;
++			clock-names = "bus", "mbus";
++			resets = <&ccu RST_BUS_DMA>;
++			dma-channels = <16>;
++			dma-requests = <49>;
++			#dma-cells = <1>;
++		};
++
++		codec: codec@5096000 {
++			compatible = "allwinner,sun8i-v831-codec";
++			/* vendor DT says 0x320, but BIAS_ANA_CTL sits at 0x320 */
++			reg = <0x05096000 0x400>;
++			clocks = <&ccu CLK_BUS_AUDIO_CODEC>,
++				 <&ccu CLK_AUDIO_CODEC_1X>;
++			clock-names = "bus", "mod";
++			resets = <&ccu RST_BUS_AUDIO_CODEC>;
++			dmas = <&dma 6>, <&dma 6>;
++			dma-names = "tx", "rx";
++			status = "disabled";
++		};
++
++		pio: pinctrl@300b000 {
++			compatible = "allwinner,sun8i-v831-pinctrl";
++			reg = <0x0300b000 0x400>;
++			interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_APB1>, <&osc24M>, <&rtc 0>;
++			clock-names = "apb", "hosc", "losc";
++			gpio-controller;
++			#gpio-cells = <3>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++
++			mmc0_pins: mmc0-pins {
++				pins = "PF0", "PF1", "PF2", "PF3",
++				       "PF4", "PF5";
++				function = "mmc0";
++				drive-strength = <30>;
++				bias-pull-up;
++			};
++
++			/omit-if-no-ref/
++			mmc1_pins: mmc1-pins {
++				pins = "PG0", "PG1", "PG2", "PG3",
++				       "PG4", "PG5";
++				function = "mmc1";
++				drive-strength = <30>;
++				bias-pull-up;
++			};
++
++			/omit-if-no-ref/
++			spi0_qspi_pins: spi0-qspi-pins {
++				pins = "PC0", "PC2", "PC3", "PC4", "PC5";
++				function = "spi0";
++			};
++
++			/omit-if-no-ref/
++			spi0_cs_pin: spi0-cs-pin {
++				pins = "PC1";
++				function = "spi0";
++			};
++
++			/omit-if-no-ref/
++			csi_mclk0_pin: csi-mclk0-pin {
++				pins = "PI0";
++				function = "csi0";
++				drive-strength = <20>;
++			};
++
++			/omit-if-no-ref/
++			i2c1_pi_pins: i2c1-pi-pins {
++				pins = "PI1", "PI2";
++				function = "i2c1";
++			};
++
++			uart0_ph9_ph10_pins: uart0-ph9-ph10-pins {
++				pins = "PH9", "PH10";
++				function = "uart0";
++				/* RX floats when no adapter is attached -> noise flood */
++				bias-pull-up;
++			};
++		};
++
++		gic: interrupt-controller@3021000 {
++			compatible = "arm,gic-400";
++			reg = <0x03021000 0x1000>,
++			      <0x03022000 0x2000>,
++			      <0x03024000 0x2000>,
++			      <0x03026000 0x2000>;
++			interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++		};
++
++		mmc0: mmc@4020000 {
++			compatible = "allwinner,sun8i-v831-mmc",
++				     "allwinner,sun50i-a64-mmc";
++			reg = <0x04020000 0x1000>;
++			clocks = <&ccu CLK_BUS_MMC0>, <&ccu CLK_MMC0>;
++			clock-names = "ahb", "mmc";
++			resets = <&ccu RST_BUS_MMC0>;
++			reset-names = "ahb";
++			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&mmc0_pins>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		mmc1: mmc@4021000 {
++			compatible = "allwinner,sun8i-v831-mmc",
++				     "allwinner,sun50i-a64-mmc";
++			reg = <0x04021000 0x1000>;
++			clocks = <&ccu CLK_BUS_MMC1>, <&ccu CLK_MMC1>;
++			clock-names = "ahb", "mmc";
++			resets = <&ccu RST_BUS_MMC1>;
++			reset-names = "ahb";
++			interrupts = <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&mmc1_pins>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		vin: video-input@6600000 {
++			compatible = "allwinner,sun8i-v831-vin";
++			reg = <0x06600000 0x800>,
++			      <0x06600800 0x200>,
++			      <0x06601000 0x1000>,
++			      <0x0660c000 0x1000>,
++			      <0x02100000 0x800>,
++			      <0x02104000 0x400>,
++			      <0x06609000 0x200>,
++			      <0x02104400 0x400>,
++			      <0x06609200 0x200>;
++			reg-names = "ccu", "top", "parser", "mipi", "isp", "vipp",
++				    "dma", "vipp1", "dma1";
++			interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "dma", "isp", "dma1";
++			/* CLK_MBUS_TS/NAND are the "mbus-csi"/"mbus-isp" gates */
++			clocks = <&ccu CLK_BUS_CSI>, <&ccu CLK_CSI_TOP>,
++				 <&ccu CLK_ISP>, <&ccu CLK_MBUS_TS>,
++				 <&ccu CLK_MBUS_NAND>;
++			clock-names = "bus", "mod", "isp", "mbus", "mbus-isp";
++			assigned-clocks = <&ccu CLK_CSI_TOP>, <&ccu CLK_ISP>;
++			assigned-clock-parents = <&ccu CLK_PLL_CSI>,
++						 <&ccu CLK_PLL_UNI>;
++			assigned-clock-rates = <270000000>, <200000000>;
++			resets = <&ccu RST_BUS_CSI>;
++			status = "disabled";
++
++			port {
++				vin_in: endpoint {
++				};
++			};
++		};
++
++		uart0: serial@5000000 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x05000000 0x400>;
++			interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_BUS_UART0>;
++			resets = <&ccu RST_BUS_UART0>;
++			status = "disabled";
++		};
++
++		uart1: serial@5000400 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x05000400 0x400>;
++			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_BUS_UART1>;
++			resets = <&ccu RST_BUS_UART1>;
++			status = "disabled";
++		};
++
++		uart2: serial@5000800 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x05000800 0x400>;
++			interrupts = <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_BUS_UART2>;
++			resets = <&ccu RST_BUS_UART2>;
++			status = "disabled";
++		};
++
++		uart3: serial@5000c00 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x05000c00 0x400>;
++			interrupts = <GIC_SPI 52 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_BUS_UART3>;
++			resets = <&ccu RST_BUS_UART3>;
++			status = "disabled";
++		};
++
++		i2c0: i2c@5002000 {
++			compatible = "allwinner,sun8i-v831-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x05002000 0x400>;
++			interrupts = <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2C0>;
++			resets = <&ccu RST_BUS_I2C0>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		i2c1: i2c@5002400 {
++			compatible = "allwinner,sun8i-v831-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x05002400 0x400>;
++			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2C1>;
++			resets = <&ccu RST_BUS_I2C1>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		i2c2: i2c@5002800 {
++			compatible = "allwinner,sun8i-v831-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x05002800 0x400>;
++			interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2C2>;
++			resets = <&ccu RST_BUS_I2C2>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		i2c3: i2c@5002c00 {
++			compatible = "allwinner,sun8i-v831-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x05002c00 0x400>;
++			interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2C3>;
++			resets = <&ccu RST_BUS_I2C3>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		spi0: spi@5010000 {
++			compatible = "allwinner,sun8i-v831-spi",
++				     "allwinner,sun50i-h6-spi",
++				     "allwinner,sun8i-h3-spi";
++			reg = <0x05010000 0x1000>;
++			interrupts = <GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_SPI0>, <&ccu CLK_SPI0>;
++			clock-names = "ahb", "mod";
++			resets = <&ccu RST_BUS_SPI0>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		spi1: spi@5011000 {
++			compatible = "allwinner,sun8i-v831-spi",
++				     "allwinner,sun50i-h6-spi",
++				     "allwinner,sun8i-h3-spi";
++			reg = <0x05011000 0x1000>;
++			interrupts = <GIC_SPI 55 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_SPI1>, <&ccu CLK_SPI1>;
++			clock-names = "ahb", "mod";
++			resets = <&ccu RST_BUS_SPI1>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++		};
++
++		rtc: rtc@7000000 {
++			compatible = "allwinner,sun8i-v831-rtc";
++			reg = <0x07000000 0x400>;
++			interrupts = <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>;
++			clock-output-names = "osc32k", "osc32k-out", "iosc";
++			#clock-cells = <1>;
++		};
++	};
++};
